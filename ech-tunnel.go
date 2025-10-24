@@ -46,7 +46,7 @@ var (
 )
 
 func init() {
-	flag.StringVar(&listenAddr, "l", "", "监听地址 (格式: tcp://localAddr/targetAddr 或 ws://ip:port 或 wss://ip:port 或 socks5://[user:pass@]ip:port)")
+	flag.StringVar(&listenAddr, "l", "", "监听地址 (tcp://监听1/目标1,监听2/目标2,... 或 ws://ip:port/path 或 wss://ip:port/path 或 socks5://[user:pass@]ip:port)")
 	flag.StringVar(&forwardAddr, "f", "", "服务地址 (格式: wss://host:port/path)")
 	flag.StringVar(&ipAddr, "ip", "", "指定解析的IP地址（仅客户端：将 wss 主机名定向到该 IP 连接）")
 	flag.StringVar(&certFile, "cert", "", "TLS证书文件路径（默认:自动生成，仅服务端）")
@@ -557,12 +557,15 @@ func handleWebSocket(wsConn *websocket.Conn) {
 // ======================== TCP 正向转发客户端（采用 ECH） ========================
 
 func runTCPClient(listenForwardAddr, wsServerAddr string) {
-	parts := strings.Split(strings.TrimPrefix(listenForwardAddr, "tcp://"), "/")
-	if len(parts) != 2 {
-		log.Fatal("tcp 地址格式错误，应为 tcp://监听地址/目标地址")
+	// 移除 tcp:// 前缀
+	rulesStr := strings.TrimPrefix(listenForwardAddr, "tcp://")
+
+	// 按逗号分割多个规则
+	rules := strings.Split(rulesStr, ",")
+
+	if len(rules) == 0 {
+		log.Fatal("TCP 地址格式错误，应为 tcp://监听地址/目标地址[,监听地址/目标地址...]")
 	}
-	listenAddress := parts[0]
-	targetAddress := parts[1]
 
 	if wsServerAddr == "" {
 		log.Fatal("TCP 正向转发客户端需要指定 WebSocket 服务端地址 (-f)")
@@ -573,9 +576,43 @@ func runTCPClient(listenForwardAddr, wsServerAddr string) {
 		log.Fatalf("[客户端] 无效的 WebSocket 服务端地址: %v", err)
 	}
 	if u.Scheme != "wss" {
-		log.Fatalf("[客户端] 仅支持 wss:// 客户端必须使用 ECH/TLS1.3）")
+		log.Fatalf("[客户端] 仅支持 wss://（客户端必须使用 ECH/TLS1.3）")
 	}
 
+	// 用于等待所有监听器
+	var wg sync.WaitGroup
+
+	// 为每个规则启动监听器
+	for _, rule := range rules {
+		rule = strings.TrimSpace(rule)
+		if rule == "" {
+			continue
+		}
+
+		parts := strings.Split(rule, "/")
+		if len(parts) != 2 {
+			log.Fatalf("规则格式错误: %s，应为 监听地址/目标地址", rule)
+		}
+
+		listenAddress := strings.TrimSpace(parts[0])
+		targetAddress := strings.TrimSpace(parts[1])
+
+		wg.Add(1)
+		go func(listen, target string) {
+			defer wg.Done()
+			startTCPListener(listen, target, wsServerAddr)
+		}(listenAddress, targetAddress)
+
+		log.Printf("[客户端] 已添加转发规则: %s -> %s", listenAddress, targetAddress)
+	}
+
+	log.Printf("[客户端] 共启动 %d 个TCP转发监听器", len(rules))
+
+	// 等待所有监听器
+	wg.Wait()
+}
+
+func startTCPListener(listenAddress, targetAddress, wsServerAddr string) {
 	// 启动本地TCP监听器
 	listener, err := net.Listen("tcp", listenAddress)
 	if err != nil {
@@ -583,16 +620,16 @@ func runTCPClient(listenForwardAddr, wsServerAddr string) {
 	}
 	defer listener.Close()
 
-	log.Printf("TCP正向转发监听器启动: %s -> (WebSocket) -> %s", listenAddress, targetAddress)
+	log.Printf("[客户端] TCP正向转发监听器启动: %s -> (WebSocket) -> %s", listenAddress, targetAddress)
 
 	for {
 		tcpConn, err := listener.Accept()
 		if err != nil {
-			log.Printf("接受TCP连接失败: %v", err)
+			log.Printf("[客户端] 接受TCP连接失败 %s: %v", listenAddress, err)
 			continue
 		}
 
-		log.Printf("[客户端] 新的TCP连接来自 %s", tcpConn.RemoteAddr())
+		log.Printf("[客户端] 新的TCP连接来自 %s，目标: %s", tcpConn.RemoteAddr(), targetAddress)
 
 		// 为每个TCP连接创建独立的WebSocket连接
 		go handleTCPConnection(tcpConn, wsServerAddr, targetAddress)
