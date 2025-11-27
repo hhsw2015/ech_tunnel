@@ -61,7 +61,7 @@ func init() {
 	flag.StringVar(&keyFile, "key", "", "TLS密钥文件路径（默认:自动生成，仅服务端）")
 	flag.StringVar(&token, "token", "", "身份验证令牌（WebSocket Subprotocol）")
 	flag.StringVar(&cidrs, "cidr", "0.0.0.0/0,::/0", "允许的来源 IP 范围 (CIDR),多个范围用逗号分隔")
-	flag.StringVar(&dnsServer, "dns", "119.29.29.29:53", "查询 ECH 公钥所用的 DNS 服务器")
+	flag.StringVar(&dnsServer, "dns", "dns.alidns.com/dns-query", "查询 ECH 公钥所用的 DoH 服务器地址)")
 	flag.StringVar(&echDomain, "ech", "cloudflare-ech.com", "用于查询 ECH 公钥的域名")
 	flag.IntVar(&connectionNum, "n", 3, "WebSocket连接数量")
 }
@@ -177,30 +177,55 @@ func buildTLSConfigWithECH(serverName string, echList []byte) (*tls.Config, erro
 }
 
 func queryHTTPSRecord(domain, dnsServer string) (string, error) {
-	query := buildDNSQuery(domain, typeHTTPS)
+	dohURL := dnsServer
+	if !strings.HasPrefix(dohURL, "https://") && !strings.HasPrefix(dohURL, "http://") {
+		dohURL = "https://" + dohURL
+	}
+	return queryDoH(domain, dohURL)
+}
 
-	conn, err := net.Dial("udp", dnsServer)
+func queryDoH(domain, dohURL string) (string, error) {
+	u, err := url.Parse(dohURL)
 	if err != nil {
-		return "", fmt.Errorf("连接 DNS 服务器失败: %v", err)
+		return "", fmt.Errorf("无效的 DoH URL: %v", err)
 	}
-	defer conn.Close()
+	q := u.Query()
+	q.Set("name", domain)
+	q.Set("type", "HTTPS")
+	dnsQuery := buildDNSQuery(domain, typeHTTPS)
+	dnsBase64 := base64.RawURLEncoding.EncodeToString(dnsQuery)
 
-	// 设置 2 秒超时
-	conn.SetDeadline(time.Now().Add(2 * time.Second))
+	q.Set("dns", dnsBase64)
+	// 移除 name 和 type，因为使用了 dns 参数
+	q.Del("name")
+	q.Del("type")
 
-	if _, err = conn.Write(query); err != nil {
-		return "", fmt.Errorf("发送查询失败: %v", err)
-	}
+	u.RawQuery = q.Encode()
 
-	response := make([]byte, 4096)
-	n, err := conn.Read(response)
+	req, err := http.NewRequest("GET", u.String(), nil)
 	if err != nil {
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			return "", fmt.Errorf("DNS 查询超时")
-		}
-		return "", fmt.Errorf("读取 DNS 响应失败: %v", err)
+		return "", fmt.Errorf("创建请求失败: %v", err)
 	}
-	return parseDNSResponse(response[:n])
+	req.Header.Set("Accept", "application/dns-message")
+	req.Header.Set("Content-Type", "application/dns-message")
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("DoH 请求失败: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("DoH 服务器返回错误: %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("读取 DoH 响应失败: %v", err)
+	}
+
+	return parseDNSResponse(body)
 }
 
 func buildDNSQuery(domain string, qtype uint16) []byte {
@@ -320,7 +345,7 @@ func generateSelfSignedCert() (tls.Certificate, error) {
 			Organization: []string{"自签名组织"},
 		},
 		NotBefore: time.Now(),
-		NotAfter:  time.Now().Add(365 * 24 * time.Hour),
+		NotAfter:  time.Now().Add(10 * 365 * 24 * time.Hour),
 		KeyUsage:  x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage: []x509.ExtKeyUsage{
 			x509.ExtKeyUsageServerAuth,
