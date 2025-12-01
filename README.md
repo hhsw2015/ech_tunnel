@@ -12,15 +12,20 @@
 - **安全特性**
   - 强制 TLS 1.3 加密传输
   - ECH (Encrypted Client Hello) 支持，隐藏真实 SNI
+  - 可选 Fallback 模式（禁用 ECH，使用标准 TLS 1.3）
   - 可选的身份验证令牌
   - 支持用户名密码认证（SOCKS5/HTTP）
   - IP 白名单（CIDR 格式）
 
 - **高性能设计**
   - **预连接多通道池** - 启动时即建立连接，请求到来时零等待
+  - **多 IP 负载分散** - 支持指定多个 IP 地址，每个 IP 建立独立连接
   - WebSocket 多路复用
   - 智能通道竞选，自动选择最优路径
   - 自动重连机制
+
+- **服务端增强**
+  - **前置 SOCKS5 代理** - 服务端可通过 SOCKS5 代理出站（支持 TCP 和 UDP）
 
 ## 核心优势：预连接多通道架构
 
@@ -44,6 +49,30 @@
                 └──► 无需握手，延迟仅 1-10ms
 ```
 
+### 多 IP 负载分散
+
+当指定多个 IP 时，连接池会在所有 IP 之间分散建立连接：
+
+```
+┌─────────┐
+│  客户端  │
+└────┬────┘
+     │ -ip 1.1.1.1,2.2.2.2 -n 2
+     │
+     ├──► IP 1.1.1.1 通道 0 ━━━━━━━► 服务端
+     ├──► IP 1.1.1.1 通道 1 ━━━━━━━► 服务端
+     ├──► IP 2.2.2.2 通道 2 ━━━━━━━► 服务端
+     └──► IP 2.2.2.2 通道 3 ━━━━━━━► 服务端
+
+总连接数 = IP数量 × 每IP连接数 = 2 × 2 = 4
+```
+
+**多 IP 的优势：**
+- **负载分散** - 将流量分散到多个 IP，避免单点瓶颈
+- **故障容错** - 单个 IP 不可用时自动使用其他 IP
+- **绕过限制** - 某些场景下突破单 IP 连接数限制
+- **提升带宽** - 聚合多个 IP 的带宽资源
+
 ### 预连接的核心优势
 
 | 特性 | 传统模式 | 预连接模式 |
@@ -51,7 +80,7 @@
 | **首包延迟** | 200-500ms（需完整握手） | **1-10ms**（直接复用） |
 | **连接稳定性** | 每次新建，不可预测 | **预先验证，稳定可靠** |
 | **故障感知** | 请求时才发现问题 | **实时检测，提前预警** |
-| **负载分散** | 单点连接 | **多通道并行** |
+| **负载分散** | 单点连接 | **多通道/多IP并行** |
 | **网络抖动影响** | 直接影响用户体验 | **连接池缓冲，影响最小化** |
 
 ### 多通道竞选机制
@@ -110,11 +139,28 @@
 │  │ TCP 转发   │  │◄━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━►│  │ TCP 转发   │  │
 │  ├────────────┤  │         预连接多通道池               │  ├────────────┤  │
 │  │ SOCKS5    │  │          (N个长连接)                │  │ UDP 转发   │  │
-│  ├────────────┤  │                                    │  └────────────┘  │
-│  │ HTTP 代理  │  │                                    │                  │
-│  └────────────┘  │                                    │                  │
+│  ├────────────┤  │                                    │  ├────────────┤  │
+│  │ HTTP 代理  │  │                                    │  │ SOCKS5前置 │  │
+│  └────────────┘  │                                    │  │   (可选)   │  │
 └──────────────────┘                                    └──────────────────┘
 ```
+
+### 服务端前置 SOCKS5 代理
+
+服务端可以配置通过 SOCKS5 代理进行出站连接，适用于：
+
+- 服务端需要通过代理访问目标网络
+- 隐藏服务端真实出口 IP
+- 突破服务端网络限制
+
+```
+┌────────┐          ┌────────┐          ┌────────┐          ┌────────┐
+│ 客户端  │ ━━━━━━━► │ 服务端  │ ━━━━━━━► │ SOCKS5 │ ━━━━━━━► │  目标  │
+│        │  WSS     │        │  代理     │  代理  │  直连     │  服务  │
+└────────┘          └────────┘          └────────┘          └────────┘
+```
+
+支持 TCP 和 UDP 流量的代理转发（UDP 通过 SOCKS5 UDP ASSOCIATE）。
 
 ### ECH (Encrypted Client Hello)
 
@@ -134,20 +180,12 @@ ECH 是 TLS 1.3 的扩展协议，用于加密 ClientHello 消息中的敏感字
          中间人只能看到外层 SNI (如 cloudflare-ech.com)
 ```
 
-**本工具的 ECH 实现：**
+**Fallback 模式：**
 
-```
-1. 启动时通过 DoH 查询 ECH 配置
-   ┌─────────┐  DoH 查询 HTTPS RR   ┌─────────┐
-   │  客户端  │ ────────────────────► │   DoH   │
-   │         │ ◄──────────────────── │  服务器  │
-   └─────────┘   ECH 公钥配置        └─────────┘
+当 ECH 不可用或不需要时，可以使用 `-fallback` 参数禁用 ECH，使用标准 TLS 1.3：
 
-2. 建立预连接时使用 ECH
-   ┌─────────┐  加密的 ClientHello  ┌─────────┐
-   │  客户端  │ ━━━━━━━━━━━━━━━━━━━► │  服务端  │
-   │         │    (SNI 被隐藏)      │         │
-   └─────────┘   预建立N个连接       └─────────┘
+```bash
+ech-tunnel -l proxy://127.0.0.1:1080 -f wss://server.com:8443/tunnel -fallback
 ```
 
 ### WebSocket 多路复用
@@ -183,15 +221,16 @@ ECH 是 TLS 1.3 的扩展协议，用于加密 ClientHello 消息中的敏感字
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
 | `-l` | 监听地址 | 必填 |
-| `-f` | WebSocket 服务端地址（客户端模式必填） | - |
-| `-ip` | 指定连接的目标 IP 地址 | - |
+| `-f` | 转发地址（客户端: `wss://host:port`，服务端: `socks5://[user:pass@]host:port`） | - |
+| `-ip` | 指定连接的目标 IP 地址，**多个 IP 用逗号分隔** | - |
 | `-cert` | TLS 证书文件路径 | 自动生成自签名证书 |
 | `-key` | TLS 密钥文件路径 | 自动生成 |
 | `-token` | 身份验证令牌（WebSocket Subprotocol） | - |
 | `-cidr` | 允许的来源 IP 范围 | `0.0.0.0/0,::/0` |
 | `-dns` | ECH 公钥查询 DoH 服务器地址 | `dns.alidns.com/dns-query` |
 | `-ech` | ECH 公钥查询域名 | `cloudflare-ech.com` |
-| `-n` | **预连接通道数量**（连接池大小） | `3` |
+| `-fallback` | **禁用 ECH，使用标准 TLS 1.3** | `false` |
+| `-n` | **每个 IP 的预连接通道数量** | `3` |
 
 ## 使用方法
 
@@ -229,6 +268,23 @@ ech-tunnel -l wss://0.0.0.0:8443/tunnel -cidr 192.168.0.0/16,10.0.0.0/8
 ech-tunnel -l wss://0.0.0.0:8443/tunnel -cidr 203.0.113.50/32
 ```
 
+#### 服务端前置 SOCKS5 代理
+
+当服务端需要通过代理访问目标时：
+
+```bash
+# 无认证的 SOCKS5 代理
+ech-tunnel -l wss://0.0.0.0:8443/tunnel -f socks5://127.0.0.1:1080
+
+# 带用户名密码认证的 SOCKS5 代理
+ech-tunnel -l wss://0.0.0.0:8443/tunnel -f socks5://user:pass@127.0.0.1:1080
+```
+
+**使用场景：**
+- 服务端在受限网络环境，需要通过代理出站
+- 隐藏服务端真实出口 IP
+- 通过代理访问特定内网资源
+
 ### 客户端
 
 #### SOCKS5/HTTP 代理模式
@@ -250,6 +306,40 @@ ech-tunnel -l proxy://127.0.0.1:1080 -f wss://server.example.com:8443/tunnel -n 
 ech-tunnel -l proxy://127.0.0.1:1080 -f wss://server.example.com:8443/tunnel -n 1
 ```
 
+#### 多 IP 连接
+
+当需要使用多个 IP 分散连接时：
+
+```bash
+# 使用 2 个 IP，每个 IP 建立 3 个连接（共 6 个连接）
+ech-tunnel -l proxy://127.0.0.1:1080 -f wss://server.example.com:8443/tunnel \
+    -ip 1.1.1.1,2.2.2.2 -n 3
+
+# 使用 3 个 IP，每个 IP 建立 2 个连接（共 6 个连接）
+ech-tunnel -l proxy://127.0.0.1:1080 -f wss://server.example.com:8443/tunnel \
+    -ip 1.1.1.1,2.2.2.2,3.3.3.3 -n 2
+```
+
+**多 IP 适用场景：**
+- 服务端有多个入口 IP（如 Anycast 或负载均衡）
+- 需要分散流量避免单点限制
+- 提高连接可靠性和容错能力
+
+#### Fallback 模式（禁用 ECH）
+
+当不需要 ECH 或 ECH 不可用时：
+
+```bash
+# 禁用 ECH，使用标准 TLS 1.3
+ech-tunnel -l proxy://127.0.0.1:1080 -f wss://server.example.com:8443/tunnel -fallback
+```
+
+**Fallback 模式适用场景：**
+- DoH 服务不可用或被阻断
+- ECH 域名无法查询
+- 服务端不在 ECH 支持的网络后面
+- 仅需要标准 TLS 1.3 加密
+
 #### TCP 端口转发模式
 
 ```bash
@@ -261,14 +351,6 @@ ech-tunnel -l tcp://127.0.0.1:8080/example.com:80,127.0.0.1:8443/example.com:443
 
 # 内网服务转发
 ech-tunnel -l tcp://127.0.0.1:3389/192.168.1.100:3389 -f wss://server.example.com:8443/tunnel
-```
-
-#### 指定连接 IP
-
-当需要绕过 DNS 或指定特定 IP 时：
-
-```bash
-ech-tunnel -l proxy://127.0.0.1:1080 -f wss://server.example.com:8443/tunnel -ip 203.0.113.10
 ```
 
 #### 自定义 ECH 配置
@@ -309,9 +391,10 @@ ech-tunnel -l proxy://127.0.0.1:1080 -f wss://your-server.com/ws -token secret12
 ech-tunnel -l wss://0.0.0.0:443/tunnel -cert cert.pem -key key.pem
 ```
 
-**客户端：**
+**客户端（连接多个 CDN 边缘节点 IP）：**
 ```bash
-ech-tunnel -l proxy://127.0.0.1:1080 -f wss://your-cdn-domain.com/tunnel
+ech-tunnel -l proxy://127.0.0.1:1080 -f wss://your-cdn-domain.com/tunnel \
+    -ip 104.16.1.1,104.16.2.2,104.16.3.3 -n 2
 ```
 
 ### 场景 3：内网穿透
@@ -332,7 +415,21 @@ ech-tunnel -l tcp://127.0.0.1:3389/192.168.1.100:3389 -f wss://server.com:8443/t
 ech-tunnel -l tcp://127.0.0.1:3306/192.168.1.50:3306 -f wss://server.com:8443/tunnel
 ```
 
-### 场景 4：多服务转发
+### 场景 4：服务端通过代理出站
+
+服务端在受限网络，需要通过 SOCKS5 代理访问外网：
+
+**服务端：**
+```bash
+ech-tunnel -l wss://0.0.0.0:8443/tunnel -f socks5://10.0.0.1:1080
+```
+
+**带认证的代理：**
+```bash
+ech-tunnel -l wss://0.0.0.0:8443/tunnel -f socks5://admin:password@10.0.0.1:1080
+```
+
+### 场景 5：多服务转发
 
 同时转发多个服务：
 
@@ -340,13 +437,23 @@ ech-tunnel -l tcp://127.0.0.1:3306/192.168.1.50:3306 -f wss://server.com:8443/tu
 ech-tunnel -l tcp://127.0.0.1:8080/web.internal:80,127.0.0.1:8443/web.internal:443,127.0.0.1:3306/db.internal:3306 -f wss://server.com:8443/tunnel
 ```
 
-### 场景 5：高并发场景
+### 场景 6：高并发 + 多 IP
 
-需要处理大量并发连接时，增加预连接通道数：
+需要处理大量并发连接时，增加预连接通道数并使用多 IP：
 
 ```bash
-# 10个预连接通道，适合高并发
-ech-tunnel -l proxy://127.0.0.1:1080 -f wss://server.com:8443/tunnel -n 10
+# 4 个 IP，每个 IP 5 个连接，共 20 个预连接通道
+ech-tunnel -l proxy://127.0.0.1:1080 -f wss://server.com:8443/tunnel \
+    -ip 1.1.1.1,2.2.2.2,3.3.3.3,4.4.4.4 -n 5
+```
+
+### 场景 7：无 ECH 环境
+
+当 ECH 不可用或不需要时：
+
+```bash
+# 使用 fallback 模式，跳过 ECH 配置查询
+ech-tunnel -l proxy://127.0.0.1:1080 -f wss://server.com:8443/tunnel -fallback
 ```
 
 ## 代理协议支持
@@ -383,19 +490,23 @@ ech-tunnel -l proxy://127.0.0.1:1080 -f wss://server.com:8443/tunnel -n 10
 ```
 [客户端] DNS 查询失败: DoH 请求失败: ...，2秒后重试...
 ```
-**解决**：更换 DoH 服务器 `-dns doh.pub/dns-query` 或 `-dns doh.360.cn/dns-query`
+**解决**：
+- 更换 DoH 服务器 `-dns doh.pub/dns-query` 或 `-dns doh.360.cn/dns-query`
+- 或使用 `-fallback` 禁用 ECH
 
 **问题**：`未找到 ECH 参数`
 ```
 [客户端] 未找到 ECH 参数（HTTPS RR key=echconfig/5），2秒后重试...
 ```
-**解决**：更换支持 ECH 的域名 `-ech cloudflare.com`
+**解决**：
+- 更换支持 ECH 的域名 `-ech cloudflare.com`
+- 或使用 `-fallback` 禁用 ECH
 
 **问题**：`服务器拒绝 ECH`
 ```
 服务器拒绝 ECH（禁止回退）
 ```
-**解决**：ECH 公钥可能已轮换，程序会自动刷新重试
+**解决**：ECH 公钥可能已轮换，程序会自动刷新重试；如持续失败可使用 `-fallback`
 
 ### 连接相关
 
@@ -405,9 +516,26 @@ ech-tunnel -l proxy://127.0.0.1:1080 -f wss://server.com:8443/tunnel -n 10
 - 检查端口是否开放
 - 验证 token 是否匹配
 - 检查证书是否有效
+- 如使用多 IP，确认所有 IP 均可达
 
 **问题**：连接超时
-**解决**：增加预连接通道数 `-n 5` 或检查网络质量
+**解决**：
+- 增加预连接通道数 `-n 5`
+- 使用多 IP 分散连接 `-ip ip1,ip2,ip3`
+- 检查网络质量
+
+### 服务端前置代理相关
+
+**问题**：`连接SOCKS5代理失败`
+**排查**：
+- 确认 SOCKS5 代理服务正在运行
+- 检查代理地址和端口是否正确
+- 验证用户名密码是否正确
+
+**问题**：`SOCKS5握手失败`
+**排查**：
+- 确认代理服务器支持的认证方式
+- 检查是否需要认证但未提供凭据
 
 ### 国内常用 DoH 服务器
 
@@ -424,6 +552,44 @@ ech-tunnel -l proxy://127.0.0.1:1080 -f wss://server.com:8443/tunnel -n 10
 | Cloudflare | `cloudflare-dns.com/dns-query` |
 | Google | `dns.google/dns-query` |
 | Quad9 | `dns.quad9.net/dns-query` |
+
+## 参数速查表
+
+### 客户端模式
+
+```bash
+# 最小配置
+ech-tunnel -l proxy://127.0.0.1:1080 -f wss://server.com/tunnel
+
+# 完整配置示例
+ech-tunnel \
+    -l proxy://user:pass@127.0.0.1:1080 \    # 带认证的代理监听
+    -f wss://server.com:8443/tunnel \         # WebSocket 服务端
+    -ip 1.1.1.1,2.2.2.2 \                     # 多 IP 连接
+    -n 3 \                                     # 每 IP 3 个连接
+    -token mytoken \                           # 认证令牌
+    -dns doh.pub/dns-query \                   # DoH 服务器
+    -ech cloudflare.com                        # ECH 域名
+
+# Fallback 模式（禁用 ECH）
+ech-tunnel -l proxy://127.0.0.1:1080 -f wss://server.com/tunnel -fallback
+```
+
+### 服务端模式
+
+```bash
+# 最小配置
+ech-tunnel -l wss://0.0.0.0:8443/tunnel
+
+# 完整配置示例
+ech-tunnel \
+    -l wss://0.0.0.0:8443/tunnel \             # WebSocket 监听
+    -f socks5://user:pass@10.0.0.1:1080 \      # 前置 SOCKS5 代理
+    -cert /path/to/cert.pem \                   # TLS 证书
+    -key /path/to/key.pem \                     # TLS 密钥
+    -token mytoken \                            # 认证令牌
+    -cidr 192.168.0.0/16,10.0.0.0/8            # IP 白名单
+```
 
 ## 许可证
 

@@ -34,7 +34,7 @@ import (
 var (
 	listenAddr    string
 	forwardAddr   string
-	ipAddr        string
+	ipAddr        string // 原始命令行参数字符串
 	certFile      string
 	keyFile       string
 	token         string
@@ -44,6 +44,7 @@ var (
 	// 新增 ECH/DNS 参数
 	dnsServer string // -dns
 	echDomain string // -ech
+	fallback  bool   // -fallback
 
 	// 运行期缓存的 ECHConfigList
 	echListMu sync.RWMutex
@@ -51,42 +52,90 @@ var (
 
 	// 多通道连接池
 	echPool *ECHPool
+
+	// 服务端 SOCKS5 代理配置
+	socks5Config *SOCKS5Config
 )
 
+// SOCKS5 代理配置结构
+type SOCKS5Config struct {
+	Host     string
+	Username string
+	Password string
+}
+
 func init() {
-	flag.StringVar(&listenAddr, "l", "", "监听地址 (tcp://监听1/目标1,监听2/目标2,... 或 ws://ip:port/path 或 wss://ip:port/path 或 proxy://[user:pass@]ip:port)")
-	flag.StringVar(&forwardAddr, "f", "", "服务地址 (格式: wss://host:port/path)")
-	flag.StringVar(&ipAddr, "ip", "", "指定解析的IP地址（仅客户端：将 wss 主机名定向到该 IP 连接）")
+	flag.StringVar(&listenAddr, "l", "", "监听地址 (tcp://监听1/目标1,... 或 ws://ip:port/path 或 wss://ip:port/path 或 proxy://[user:pass@]ip:port)")
+	flag.StringVar(&forwardAddr, "f", "", "服务地址/代理地址 (客户端模式: wss://host:port | 服务端模式: socks5://[user:pass@]host:port)")
+	flag.StringVar(&ipAddr, "ip", "", "指定解析的IP地址（仅客户端：将 wss 主机名定向到该 IP 连接，多个IP用逗号分隔）")
 	flag.StringVar(&certFile, "cert", "", "TLS证书文件路径（默认:自动生成，仅服务端）")
 	flag.StringVar(&keyFile, "key", "", "TLS密钥文件路径（默认:自动生成，仅服务端）")
 	flag.StringVar(&token, "token", "", "身份验证令牌（WebSocket Subprotocol）")
 	flag.StringVar(&cidrs, "cidr", "0.0.0.0/0,::/0", "允许的来源 IP 范围 (CIDR),多个范围用逗号分隔")
 	flag.StringVar(&dnsServer, "dns", "dns.alidns.com/dns-query", "查询 ECH 公钥所用的 DoH 服务器地址")
 	flag.StringVar(&echDomain, "ech", "cloudflare-ech.com", "用于查询 ECH 公钥的域名")
-	flag.IntVar(&connectionNum, "n", 3, "WebSocket连接数量")
+	flag.BoolVar(&fallback, "fallback", false, "是否禁用 ECH 并回落到普通 TLS 1.3 (默认 false)")
+	flag.IntVar(&connectionNum, "n", 3, "每个IP建立的WebSocket连接数量")
 }
 
 func main() {
 	flag.Parse()
 
+	// 解析多IP参数
+	var targetIPs []string
+	if ipAddr != "" {
+		parts := strings.Split(ipAddr, ",")
+		for _, p := range parts {
+			trimmed := strings.TrimSpace(p)
+			if trimmed != "" {
+				targetIPs = append(targetIPs, trimmed)
+			}
+		}
+	}
+
+	// 服务端模式
 	if strings.HasPrefix(listenAddr, "ws://") || strings.HasPrefix(listenAddr, "wss://") {
+		// 在服务端模式下，解析 -f 参数作为 SOCKS5 前置代理
+		if forwardAddr != "" {
+			config, err := parseSOCKS5Addr(forwardAddr)
+			if err != nil {
+				log.Fatalf("解析SOCKS5代理地址失败: %v", err)
+			}
+			socks5Config = config
+			log.Printf("[服务端] 使用SOCKS5前置代理: %s", config.Host)
+			if config.Username != "" {
+				log.Printf("[服务端] SOCKS5代理认证已启用，用户名: %s", config.Username)
+			}
+		} else {
+			log.Printf("[服务端] 直连模式（未配置SOCKS5代理）")
+		}
 		runWebSocketServer(listenAddr)
 		return
 	}
+
+	// 客户端 TCP 转发模式
 	if strings.HasPrefix(listenAddr, "tcp://") {
-		// 客户端模式：预先获取 ECH 公钥（失败则直接退出，严格禁止回退）
-		if err := prepareECH(); err != nil {
-			log.Fatalf("[客户端] 获取 ECH 公钥失败: %v", err)
+		if !fallback {
+			if err := prepareECH(); err != nil {
+				log.Fatalf("[客户端] 获取 ECH 公钥失败: %v", err)
+			}
+		} else {
+			log.Printf("[客户端] fallback 模式已启用：禁用 ECH，使用标准 TLS 1.3")
 		}
-		runTCPClient(listenAddr, forwardAddr)
+		runTCPClient(listenAddr, forwardAddr, targetIPs)
 		return
 	}
+
+	// 客户端 代理模式
 	if strings.HasPrefix(listenAddr, "proxy://") {
-		// 代理模式（支持 SOCKS5 和 HTTP）：预先获取 ECH 公钥
-		if err := prepareECH(); err != nil {
-			log.Fatalf("[代理] 获取 ECH 公钥失败: %v", err)
+		if !fallback {
+			if err := prepareECH(); err != nil {
+				log.Fatalf("[代理] 获取 ECH 公钥失败: %v", err)
+			}
+		} else {
+			log.Printf("[代理] fallback 模式已启用：禁用 ECH，使用标准 TLS 1.3")
 		}
-		runProxyServer(listenAddr, forwardAddr)
+		runProxyServer(listenAddr, forwardAddr, targetIPs)
 		return
 	}
 
@@ -106,6 +155,403 @@ func isNormalCloseError(err error) bool {
 		strings.Contains(errStr, "broken pipe") ||
 		strings.Contains(errStr, "connection reset by peer") ||
 		strings.Contains(errStr, "normal closure")
+}
+
+// ======================== SOCKS5 辅助函数 (服务端用) ========================
+
+// 解析 SOCKS5 代理地址
+func parseSOCKS5Addr(addr string) (*SOCKS5Config, error) {
+	addr = strings.TrimPrefix(addr, "socks5://")
+	config := &SOCKS5Config{}
+
+	if strings.Contains(addr, "@") {
+		parts := strings.SplitN(addr, "@", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("无效的SOCKS5地址格式")
+		}
+		auth := parts[0]
+		if strings.Contains(auth, ":") {
+			authParts := strings.SplitN(auth, ":", 2)
+			config.Username = authParts[0]
+			config.Password = authParts[1]
+		}
+		config.Host = parts[1]
+	} else {
+		config.Host = addr
+	}
+	return config, nil
+}
+
+// 通过 SOCKS5 代理拨号（TCP）
+func dialViaSocks5(network, addr string) (net.Conn, error) {
+	if socks5Config == nil {
+		return net.DialTimeout(network, addr, 10*time.Second)
+	}
+
+	// 连接到 SOCKS5 代理服务器
+	proxyConn, err := net.DialTimeout("tcp", socks5Config.Host, 10*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("连接SOCKS5代理失败: %v", err)
+	}
+
+	// SOCKS5 握手
+	if err := socks5Handshake(proxyConn, socks5Config); err != nil {
+		proxyConn.Close()
+		return nil, fmt.Errorf("SOCKS5握手失败: %v", err)
+	}
+
+	// SOCKS5 CONNECT 请求
+	if err := socks5Connect(proxyConn, addr); err != nil {
+		proxyConn.Close()
+		return nil, fmt.Errorf("SOCKS5 CONNECT失败: %v", err)
+	}
+
+	return proxyConn, nil
+}
+
+// SOCKS5 握手
+func socks5Handshake(conn net.Conn, config *SOCKS5Config) error {
+	var methods []byte
+	if config.Username != "" && config.Password != "" {
+		methods = []byte{0x00, 0x02}
+	} else {
+		methods = []byte{0x00}
+	}
+
+	greeting := make([]byte, 2+len(methods))
+	greeting[0] = 0x05
+	greeting[1] = byte(len(methods))
+	copy(greeting[2:], methods)
+
+	if _, err := conn.Write(greeting); err != nil {
+		return fmt.Errorf("发送问候失败: %v", err)
+	}
+
+	response := make([]byte, 2)
+	if _, err := io.ReadFull(conn, response); err != nil {
+		return fmt.Errorf("读取问候响应失败: %v", err)
+	}
+
+	if response[0] != 0x05 {
+		return fmt.Errorf("不支持的SOCKS版本: %d", response[0])
+	}
+
+	switch response[1] {
+	case 0x00:
+		return nil
+	case 0x02:
+		return socks5UserPassAuthSrv(conn, config.Username, config.Password)
+	case 0xFF:
+		return errors.New("服务器不接受任何认证方法")
+	default:
+		return fmt.Errorf("不支持的认证方法: %d", response[1])
+	}
+}
+
+// SOCKS5 用户名密码认证 (客户端侧)
+func socks5UserPassAuthSrv(conn net.Conn, username, password string) error {
+	authReq := make([]byte, 3+len(username)+len(password))
+	authReq[0] = 0x01
+	authReq[1] = byte(len(username))
+	copy(authReq[2:], username)
+	authReq[2+len(username)] = byte(len(password))
+	copy(authReq[3+len(username):], password)
+
+	if _, err := conn.Write(authReq); err != nil {
+		return fmt.Errorf("发送认证请求失败: %v", err)
+	}
+
+	response := make([]byte, 2)
+	if _, err := io.ReadFull(conn, response); err != nil {
+		return fmt.Errorf("读取认证响应失败: %v", err)
+	}
+
+	if response[1] != 0x00 {
+		return errors.New("认证失败")
+	}
+	return nil
+}
+
+// SOCKS5 CONNECT 请求
+func socks5Connect(conn net.Conn, addr string) error {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("解析地址失败: %v", err)
+	}
+	port := 0
+	fmt.Sscanf(portStr, "%d", &port)
+
+	var request []byte
+	ip := net.ParseIP(host)
+	if ip != nil {
+		if ip4 := ip.To4(); ip4 != nil {
+			request = make([]byte, 10)
+			request[0], request[1], request[2], request[3] = 0x05, 0x01, 0x00, 0x01
+			copy(request[4:8], ip4)
+			request[8] = byte(port >> 8)
+			request[9] = byte(port)
+		} else {
+			request = make([]byte, 22)
+			request[0], request[1], request[2], request[3] = 0x05, 0x01, 0x00, 0x04
+			copy(request[4:20], ip)
+			request[20] = byte(port >> 8)
+			request[21] = byte(port)
+		}
+	} else {
+		request = make([]byte, 7+len(host))
+		request[0], request[1], request[2], request[3] = 0x05, 0x01, 0x00, 0x03
+		request[4] = byte(len(host))
+		copy(request[5:], host)
+		request[5+len(host)] = byte(port >> 8)
+		request[6+len(host)] = byte(port)
+	}
+
+	if _, err := conn.Write(request); err != nil {
+		return fmt.Errorf("发送CONNECT请求失败: %v", err)
+	}
+
+	response := make([]byte, 4)
+	if _, err := io.ReadFull(conn, response); err != nil {
+		return fmt.Errorf("读取CONNECT响应失败: %v", err)
+	}
+	if response[0] != 0x05 {
+		return fmt.Errorf("不支持的SOCKS版本: %d", response[0])
+	}
+	if response[1] != 0x00 {
+		return fmt.Errorf("CONNECT失败，状态码: %d", response[1])
+	}
+
+	// 消耗掉 BND.ADDR 和 BND.PORT
+	switch response[3] {
+	case 0x01:
+		_, _ = io.ReadFull(conn, make([]byte, 6))
+	case 0x03:
+		lenBuf := make([]byte, 1)
+		if _, err := io.ReadFull(conn, lenBuf); err != nil {
+			return err
+		}
+		_, _ = io.ReadFull(conn, make([]byte, int(lenBuf[0])+2))
+	case 0x04:
+		_, _ = io.ReadFull(conn, make([]byte, 18))
+	}
+	return nil
+}
+
+// ======================== SOCKS5 UDP ASSOCIATE (服务端用) ========================
+
+// UDPRelayer 接口：统一 Direct UDP 和 SOCKS5 UDP
+type UDPRelayer interface {
+	Read(buffer []byte) (int, *net.UDPAddr, error)
+	Write(data []byte) (int, error)
+	SetReadDeadline(t time.Time) error
+	Close() error
+}
+
+// DirectUDPRelayer 直连 UDP 实现
+type DirectUDPRelayer struct {
+	conn   *net.UDPConn
+	target *net.UDPAddr
+}
+
+func (d *DirectUDPRelayer) Read(buffer []byte) (int, *net.UDPAddr, error) {
+	return d.conn.ReadFromUDP(buffer)
+}
+func (d *DirectUDPRelayer) Write(data []byte) (int, error) {
+	return d.conn.WriteToUDP(data, d.target)
+}
+func (d *DirectUDPRelayer) SetReadDeadline(t time.Time) error {
+	return d.conn.SetReadDeadline(t)
+}
+func (d *DirectUDPRelayer) Close() error {
+	return d.conn.Close()
+}
+
+// SOCKS5UDPRelay 代理 UDP 实现
+type SOCKS5UDPRelay struct {
+	tcpConn    net.Conn
+	udpConn    *net.UDPConn
+	relayAddr  *net.UDPAddr
+	targetAddr *net.UDPAddr
+	mu         sync.Mutex
+	closed     bool
+}
+
+func newSOCKS5UDPRelay(targetAddr string) (*SOCKS5UDPRelay, error) {
+	if socks5Config == nil {
+		return nil, errors.New("SOCKS5 config is nil")
+	}
+	// 连接到 SOCKS5 代理服务器
+	tcpConn, err := net.DialTimeout("tcp", socks5Config.Host, 10*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("连接SOCKS5代理失败: %v", err)
+	}
+
+	err = socks5Handshake(tcpConn, socks5Config)
+	if err != nil {
+		tcpConn.Close()
+		return nil, fmt.Errorf("SOCKS5握手失败: %v", err)
+	}
+
+	// UDP ASSOCIATE
+	req := []byte{0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0} // 0.0.0.0:0
+
+	_, err = tcpConn.Write(req)
+	if err != nil {
+		tcpConn.Close()
+		return nil, fmt.Errorf("发送UDP ASSOCIATE失败: %v", err)
+	}
+
+	resp := make([]byte, 4)
+	_, err = io.ReadFull(tcpConn, resp)
+	if err != nil {
+		tcpConn.Close()
+		return nil, fmt.Errorf("读取UDP ASSOCIATE响应失败: %v", err)
+	}
+
+	if resp[1] != 0x00 {
+		tcpConn.Close()
+		return nil, fmt.Errorf("UDP ASSOCIATE拒绝: %d", resp[1])
+	}
+
+	// 解析 Relay 地址
+	var relayHost string
+	switch resp[3] {
+	case 0x01:
+		ipBuf := make([]byte, 4)
+		io.ReadFull(tcpConn, ipBuf)
+		relayHost = net.IP(ipBuf).String()
+	case 0x03:
+		lenBuf := make([]byte, 1)
+		io.ReadFull(tcpConn, lenBuf)
+		domainBuf := make([]byte, lenBuf[0])
+		io.ReadFull(tcpConn, domainBuf)
+		relayHost = string(domainBuf)
+	case 0x04:
+		ipBuf := make([]byte, 16)
+		io.ReadFull(tcpConn, ipBuf)
+		relayHost = net.IP(ipBuf).String()
+	}
+	portBuf := make([]byte, 2)
+	io.ReadFull(tcpConn, portBuf)
+	relayPort := int(portBuf[0])<<8 | int(portBuf[1])
+
+	if relayHost == "0.0.0.0" || relayHost == "::" {
+		h, _, _ := net.SplitHostPort(socks5Config.Host)
+		relayHost = h
+	}
+
+	relayAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", relayHost, relayPort))
+	if err != nil {
+		tcpConn.Close()
+		return nil, err
+	}
+
+	tAddr, err := net.ResolveUDPAddr("udp", targetAddr)
+	if err != nil {
+		tcpConn.Close()
+		return nil, err
+	}
+
+	localUDP, err := net.ListenUDP("udp", nil)
+	if err != nil {
+		tcpConn.Close()
+		return nil, err
+	}
+
+	log.Printf("[服务端UDP] SOCKS5 UDP中继: %s -> %s", relayAddr, targetAddr)
+
+	return &SOCKS5UDPRelay{
+		tcpConn:    tcpConn,
+		udpConn:    localUDP,
+		relayAddr:  relayAddr,
+		targetAddr: tAddr,
+	}, nil
+}
+
+func (r *SOCKS5UDPRelay) Write(data []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return 0, errors.New("closed")
+	}
+	pkt := buildSOCKS5UDPPacketData(r.targetAddr, data)
+	return r.udpConn.WriteToUDP(pkt, r.relayAddr)
+}
+
+func (r *SOCKS5UDPRelay) Read(buffer []byte) (int, *net.UDPAddr, error) {
+	if r.closed {
+		return 0, nil, errors.New("closed")
+	}
+	buf := make([]byte, 65535)
+	n, _, err := r.udpConn.ReadFromUDP(buf)
+	if err != nil {
+		return 0, nil, err
+	}
+	srcAddr, payload, err := parseSOCKS5UDPResp(buf[:n])
+	if err != nil {
+		return 0, nil, err
+	}
+	copy(buffer, payload)
+	return len(payload), srcAddr, nil
+}
+
+func (r *SOCKS5UDPRelay) SetReadDeadline(t time.Time) error {
+	return r.udpConn.SetReadDeadline(t)
+}
+
+func (r *SOCKS5UDPRelay) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return nil
+	}
+	r.closed = true
+	r.udpConn.Close()
+	r.tcpConn.Close()
+	return nil
+}
+
+func buildSOCKS5UDPPacketData(target *net.UDPAddr, data []byte) []byte {
+	var packet []byte
+	packet = append(packet, 0x00, 0x00, 0x00) // RSV, FRAG
+	if ip4 := target.IP.To4(); ip4 != nil {
+		packet = append(packet, 0x01)
+		packet = append(packet, ip4...)
+	} else {
+		packet = append(packet, 0x04)
+		packet = append(packet, target.IP...)
+	}
+	portBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(portBytes, uint16(target.Port))
+	packet = append(packet, portBytes...)
+	packet = append(packet, data...)
+	return packet
+}
+
+func parseSOCKS5UDPResp(packet []byte) (*net.UDPAddr, []byte, error) {
+	if len(packet) < 10 {
+		return nil, nil, fmt.Errorf("short packet")
+	}
+	atyp := packet[3]
+	offset := 4
+	var host string
+	switch atyp {
+	case 0x01:
+		host = net.IP(packet[offset : offset+4]).String()
+		offset += 4
+	case 0x03:
+		l := int(packet[offset])
+		offset++
+		host = string(packet[offset : offset+l])
+		offset += l
+	case 0x04:
+		host = net.IP(packet[offset : offset+16]).String()
+		offset += 16
+	}
+	port := int(packet[offset])<<8 | int(packet[offset+1])
+	offset += 2
+	addr, _ := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", host, port))
+	return addr, packet[offset:], nil
 }
 
 // ======================== ECH 相关（客户端） ========================
@@ -145,11 +591,17 @@ func prepareECH() error {
 
 // 刷新 ECH 配置（用于重试）
 func refreshECH() error {
+	if fallback {
+		return nil
+	}
 	log.Printf("[ECH] 刷新 ECH 公钥配置...")
 	return prepareECH()
 }
 
 func getECHList() ([]byte, error) {
+	if fallback {
+		return nil, nil
+	}
 	echListMu.RLock()
 	defer echListMu.RUnlock()
 	if len(echList) == 0 {
@@ -172,6 +624,19 @@ func buildTLSConfigWithECH(serverName string, echList []byte) (*tls.Config, erro
 			return errors.New("服务器拒绝 ECH（禁止回退）")
 		},
 		RootCAs: roots,
+	}
+	return tcfg, nil
+}
+
+func buildStandardTLSConfig(serverName string) (*tls.Config, error) {
+	roots, err := x509.SystemCertPool()
+	if err != nil {
+		return nil, fmt.Errorf("加载系统根证书失败: %w", err)
+	}
+	tcfg := &tls.Config{
+		MinVersion: tls.VersionTLS13,
+		ServerName: serverName,
+		RootCAs:    roots,
 	}
 	return tcfg, nil
 }
@@ -397,8 +862,8 @@ func runWebSocketServer(addr string) {
 			}
 			return []string{token}
 		}(),
-		ReadBufferSize:  65536, // 增加读缓冲区到64KB
-		WriteBufferSize: 65536, // 增加写缓冲区到64KB
+		ReadBufferSize:  65536,
+		WriteBufferSize: 65536,
 	}
 
 	http.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
@@ -476,47 +941,39 @@ func runWebSocketServer(addr string) {
 }
 
 func handleWebSocket(wsConn *websocket.Conn) {
-	// 创建一个 context 用于通知所有 goroutine 退出
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel() // 函数退出时取消所有子 goroutine
+	defer cancel()
 
 	var mu sync.Mutex
 	var connMu sync.RWMutex
 	conns := make(map[string]net.Conn)
 
-	// UDP 连接管理
-	udpConns := make(map[string]*net.UDPConn)
-	udpTargets := make(map[string]*net.UDPAddr)
+	// UDP 连接管理 (使用接口以支持 SOCKS5 代理)
+	udpRelays := make(map[string]UDPRelayer)
 
 	defer func() {
-		// 先取消所有 goroutine
 		cancel()
 
-		// 关闭所有 TCP 连接（这会让阻塞的 Read 立即返回错误）
 		connMu.Lock()
 		for id, c := range conns {
 			_ = c.Close()
 			log.Printf("[服务端] 清理TCP连接: %s", id)
+			delete(conns, id)
 		}
-		conns = make(map[string]net.Conn)
 		connMu.Unlock()
 
-		// 关闭所有 UDP 连接
 		connMu.Lock()
-		for id, uc := range udpConns {
-			_ = uc.Close()
+		for id, r := range udpRelays {
+			_ = r.Close()
 			log.Printf("[服务端] 清理UDP连接: %s", id)
+			delete(udpRelays, id)
 		}
-		udpConns = make(map[string]*net.UDPConn)
-		udpTargets = make(map[string]*net.UDPAddr)
 		connMu.Unlock()
 
-		// 最后关闭 WebSocket
 		_ = wsConn.Close()
 		log.Printf("WebSocket 连接 %s 已完全清理", wsConn.RemoteAddr())
 	}()
 
-	// 设置WebSocket保活
 	wsConn.SetPingHandler(func(message string) error {
 		mu.Lock()
 		defer mu.Unlock()
@@ -529,11 +986,11 @@ func handleWebSocket(wsConn *websocket.Conn) {
 			if !isNormalCloseError(readErr) {
 				log.Printf("WebSocket 读取失败 %s: %v", wsConn.RemoteAddr(), readErr)
 			}
-			return // defer 会触发清理
+			return
 		}
 
 		if typ == websocket.BinaryMessage {
-			// 处理 UDP 数据（带 connID）
+			// 处理 UDP 数据
 			if len(msg) > 9 && string(msg[:9]) == "UDP_DATA:" {
 				s := string(msg)
 				parts := strings.SplitN(s[9:], "|", 2)
@@ -542,23 +999,20 @@ func handleWebSocket(wsConn *websocket.Conn) {
 					data := []byte(parts[1])
 
 					connMu.RLock()
-					udpConn, ok1 := udpConns[connID]
-					targetAddr, ok2 := udpTargets[connID]
+					relay, ok := udpRelays[connID]
 					connMu.RUnlock()
-					if ok1 {
-						if ok2 {
-							if _, err := udpConn.WriteToUDP(data, targetAddr); err != nil {
-								log.Printf("[服务端UDP:%s] 发送到目标失败: %v", connID, err)
-							} else {
-								log.Printf("[服务端UDP:%s] 已发送数据到 %s，大小: %d", connID, targetAddr.String(), len(data))
-							}
+					if ok {
+						if _, err := relay.Write(data); err != nil {
+							log.Printf("[服务端UDP:%s] 发送失败: %v", connID, err)
+						} else {
+							// log.Printf("[服务端UDP:%s] 已发送数据，大小: %d", connID, len(data))
 						}
 					}
 				}
 				continue
 			}
 
-			// 支持二进制携带文本前缀 "DATA:" 进行多路复用
+			// TCP 多路复用
 			if len(msg) > 5 && string(msg[:5]) == "DATA:" {
 				s := string(msg)
 				parts := strings.SplitN(s[5:], "|", 2)
@@ -581,7 +1035,7 @@ func handleWebSocket(wsConn *websocket.Conn) {
 
 		data := string(msg)
 
-		// UDP_CONNECT: 建立 UDP 连接（带 connID）
+		// UDP_CONNECT
 		if strings.HasPrefix(data, "UDP_CONNECT:") {
 			parts := strings.SplitN(data[12:], "|", 2)
 			if len(parts) == 2 {
@@ -589,19 +1043,27 @@ func handleWebSocket(wsConn *websocket.Conn) {
 				targetAddr := parts[1]
 				log.Printf("[服务端UDP:%s] 收到UDP连接请求，目标: %s", connID, targetAddr)
 
-				udpAddr, err := net.ResolveUDPAddr("udp", targetAddr)
-				if err != nil {
-					log.Printf("[服务端UDP:%s] 解析目标地址失败: %v", connID, err)
-					mu.Lock()
-					_ = wsConn.WriteMessage(websocket.TextMessage, []byte("UDP_ERROR:"+connID+"|解析地址失败"))
-					mu.Unlock()
-					continue
+				var relay UDPRelayer
+				var err error
+
+				if socks5Config != nil {
+					// 使用 SOCKS5 代理
+					relay, err = newSOCKS5UDPRelay(targetAddr)
+				} else {
+					// 直连模式
+					var udpAddr *net.UDPAddr
+					udpAddr, err = net.ResolveUDPAddr("udp", targetAddr)
+					if err == nil {
+						var udpConn *net.UDPConn
+						udpConn, err = net.ListenUDP("udp", nil)
+						if err == nil {
+							relay = &DirectUDPRelayer{conn: udpConn, target: udpAddr}
+						}
+					}
 				}
 
-				// 为每个 UDP 连接创建独立的套接字
-				udpConn, err := net.ListenUDP("udp", nil)
 				if err != nil {
-					log.Printf("[服务端UDP:%s] 创建UDP套接字失败: %v", connID, err)
+					log.Printf("[服务端UDP:%s] 创建UDP失败: %v", connID, err)
 					mu.Lock()
 					_ = wsConn.WriteMessage(websocket.TextMessage, []byte("UDP_ERROR:"+connID+"|创建UDP失败"))
 					mu.Unlock()
@@ -609,35 +1071,31 @@ func handleWebSocket(wsConn *websocket.Conn) {
 				}
 
 				connMu.Lock()
-				udpConns[connID] = udpConn
-				udpTargets[connID] = udpAddr
+				udpRelays[connID] = relay
 				connMu.Unlock()
 
-				// 启动 UDP 接收 goroutine（监听 context 取消）
-				go func(cID string, uc *net.UDPConn, ctx context.Context) {
+				// 启动 UDP 接收 goroutine
+				go func(cID string, r UDPRelayer, ctx context.Context) {
 					defer func() {
 						connMu.Lock()
-						delete(udpConns, cID)
-						delete(udpTargets, cID)
+						delete(udpRelays, cID)
 						connMu.Unlock()
-						_ = uc.Close()
+						_ = r.Close()
 					}()
 
 					buffer := make([]byte, 65535)
 					for {
 						select {
 						case <-ctx.Done():
-							log.Printf("[服务端UDP:%s] 上下文取消，退出接收循环", cID)
 							return
 						default:
 						}
 
-						// 设置短超时，避免永久阻塞
-						_ = uc.SetReadDeadline(time.Now().Add(1 * time.Second))
-						n, addr, err := uc.ReadFromUDP(buffer)
+						_ = r.SetReadDeadline(time.Now().Add(1 * time.Second))
+						n, addr, err := r.Read(buffer)
 						if err != nil {
 							if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-								continue // 超时继续循环，检查 ctx
+								continue
 							}
 							if !isNormalCloseError(err) {
 								log.Printf("[服务端UDP:%s] 读取失败: %v", cID, err)
@@ -645,9 +1103,6 @@ func handleWebSocket(wsConn *websocket.Conn) {
 							return
 						}
 
-						log.Printf("[服务端UDP:%s] 收到响应来自 %s，大小: %d", cID, addr.String(), n)
-
-						// 构建响应消息: UDP_DATA:<connID>|<host>:<port>|<data>
 						host, portStr, _ := net.SplitHostPort(addr.String())
 						response := []byte(fmt.Sprintf("UDP_DATA:%s|%s:%s|", cID, host, portStr))
 						response = append(response, buffer[:n]...)
@@ -656,11 +1111,10 @@ func handleWebSocket(wsConn *websocket.Conn) {
 						_ = wsConn.WriteMessage(websocket.BinaryMessage, response)
 						mu.Unlock()
 					}
-				}(connID, udpConn, ctx)
+				}(connID, relay, ctx)
 
 				log.Printf("[服务端UDP:%s] UDP目标已设置: %s", connID, targetAddr)
 
-				// 通知客户端连接成功
 				mu.Lock()
 				_ = wsConn.WriteMessage(websocket.TextMessage, []byte("UDP_CONNECTED:"+connID))
 				mu.Unlock()
@@ -668,21 +1122,20 @@ func handleWebSocket(wsConn *websocket.Conn) {
 			continue
 		}
 
-		// UDP_CLOSE: 关闭 UDP 连接
+		// UDP_CLOSE
 		if strings.HasPrefix(data, "UDP_CLOSE:") {
 			connID := strings.TrimPrefix(data, "UDP_CLOSE:")
 			connMu.Lock()
-			if uc, ok := udpConns[connID]; ok {
-				_ = uc.Close()
-				delete(udpConns, connID)
-				delete(udpTargets, connID)
+			if r, ok := udpRelays[connID]; ok {
+				_ = r.Close()
+				delete(udpRelays, connID)
 				log.Printf("[服务端UDP:%s] 连接已关闭", connID)
 			}
 			connMu.Unlock()
 			continue
 		}
 
-		// CLAIM: 认领竞选（多通道）
+		// CLAIM
 		if strings.HasPrefix(data, "CLAIM:") {
 			parts := strings.SplitN(data[6:], "|", 2)
 			if len(parts) == 2 {
@@ -695,7 +1148,7 @@ func handleWebSocket(wsConn *websocket.Conn) {
 			continue
 		}
 
-		// TCP: 多路复用建连
+		// TCP
 		if strings.HasPrefix(data, "TCP:") {
 			parts := strings.SplitN(data[4:], "|", 3)
 			if len(parts) >= 2 {
@@ -706,9 +1159,8 @@ func handleWebSocket(wsConn *websocket.Conn) {
 					firstFrameData = parts[2]
 				}
 
-				log.Printf("[服务端] 请求TCP转发，连接ID: %s，目标: %s，首帧长度: %d", connID, targetAddr, len(firstFrameData))
+				log.Printf("[服务端] 请求TCP转发，连接ID: %s，目标: %s", connID, targetAddr)
 
-				// 启动连接处理 goroutine（传入 ctx）
 				go handleTCPConnection(ctx, connID, targetAddr, firstFrameData, wsConn, &mu, &connMu, conns)
 			}
 			continue
@@ -742,7 +1194,7 @@ func handleWebSocket(wsConn *websocket.Conn) {
 	}
 }
 
-// ======================== 独立的 TCP 连接处理函数（监听 context） ========================
+// ======================== 独立的 TCP 连接处理函数 ========================
 func handleTCPConnection(
 	ctx context.Context,
 	connID, targetAddr, firstFrameData string,
@@ -751,7 +1203,8 @@ func handleTCPConnection(
 	connMu *sync.RWMutex,
 	conns map[string]net.Conn,
 ) {
-	tcpConn, err := net.Dial("tcp", targetAddr)
+	// 使用 dialViaSocks5 支持代理或直连
+	tcpConn, err := dialViaSocks5("tcp", targetAddr)
 	if err != nil {
 		log.Printf("[服务端] 连接目标地址 %s 失败: %v", targetAddr, err)
 		mu.Lock()
@@ -760,12 +1213,10 @@ func handleTCPConnection(
 		return
 	}
 
-	// 保存连接
 	connMu.Lock()
 	conns[connID] = tcpConn
 	connMu.Unlock()
 
-	// 确保退出时清理
 	defer func() {
 		_ = tcpConn.Close()
 		connMu.Lock()
@@ -774,7 +1225,6 @@ func handleTCPConnection(
 		log.Printf("[服务端] TCP连接已清理: %s", connID)
 	}()
 
-	// 发送第一帧
 	if firstFrameData != "" {
 		if _, err := tcpConn.Write([]byte(firstFrameData)); err != nil {
 			log.Printf("[服务端] 发送第一帧失败: %v", err)
@@ -785,12 +1235,10 @@ func handleTCPConnection(
 		}
 	}
 
-	// 通知客户端连接成功
 	mu.Lock()
 	_ = wsConn.WriteMessage(websocket.TextMessage, []byte("CONNECTED:"+connID))
 	mu.Unlock()
 
-	// 启动读取 goroutine（监听 ctx.Done()）
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -798,19 +1246,17 @@ func handleTCPConnection(
 		for {
 			select {
 			case <-ctx.Done():
-				// WebSocket 已关闭，强制关闭 TCP 连接
 				log.Printf("[服务端] WebSocket 已关闭，强制关闭 TCP 连接: %s", connID)
 				_ = tcpConn.Close()
 				return
 			default:
 			}
 
-			// 设置短超时，避免永久阻塞
 			_ = tcpConn.SetReadDeadline(time.Now().Add(1 * time.Second))
 			n, err := tcpConn.Read(buf)
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					continue // 超时继续循环，检查 ctx
+					continue
 				}
 				if !isNormalCloseError(err) {
 					log.Printf("[服务端] 从目标读取失败: %v", err)
@@ -834,13 +1280,12 @@ func handleTCPConnection(
 		}
 	}()
 
-	// 等待读取 goroutine 结束
 	<-done
 }
 
 // ======================== TCP 正向转发客户端（采用 ECH） ========================
 
-func runTCPClient(listenForwardAddr, wsServerAddr string) {
+func runTCPClient(listenForwardAddr, wsServerAddr string, targetIPs []string) {
 	// 移除 tcp:// 前缀
 	rulesStr := strings.TrimPrefix(listenForwardAddr, "tcp://")
 
@@ -863,7 +1308,7 @@ func runTCPClient(listenForwardAddr, wsServerAddr string) {
 		log.Fatalf("[客户端] 仅支持 wss://（客户端必须使用 ECH/TLS1.3）")
 	}
 
-	echPool = NewECHPool(wsServerAddr, connectionNum)
+	echPool = NewECHPool(wsServerAddr, connectionNum, targetIPs)
 	echPool.Start()
 
 	var wg sync.WaitGroup
@@ -959,8 +1404,8 @@ func startMultiChannelTCPForwarder(listenAddress, targetAddress string, pool *EC
 	}
 }
 
-// dialWebSocketWithECH 建立 WebSocket 连接（带 ECH 重试）
-func dialWebSocketWithECH(wsServerAddr string, maxRetries int) (*websocket.Conn, error) {
+// dialWebSocketWithECH 建立 WebSocket 连接（带 ECH 重试，支持 fallback，支持多IP）
+func dialWebSocketWithECH(wsServerAddr string, maxRetries int, remoteIP string) (*websocket.Conn, error) {
 	u, err := url.Parse(wsServerAddr)
 	if err != nil {
 		return nil, fmt.Errorf("解析 wsServerAddr 失败: %v", err)
@@ -968,22 +1413,31 @@ func dialWebSocketWithECH(wsServerAddr string, maxRetries int) (*websocket.Conn,
 	serverName := u.Hostname()
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		echBytes, echErr := getECHList()
-		if echErr != nil {
-			log.Printf("[ECH] 获取 ECH 配置失败: %v", echErr)
-			if attempt < maxRetries {
-				log.Printf("[ECH] 尝试刷新 ECH 配置...")
-				if refreshErr := refreshECH(); refreshErr != nil {
-					log.Printf("[ECH] 刷新失败: %v", refreshErr)
+		var tlsCfg *tls.Config
+		var tlsErr error
+
+		if fallback {
+			// Fallback 模式：使用标准 TLS 1.3
+			tlsCfg, tlsErr = buildStandardTLSConfig(serverName)
+		} else {
+			// 正常模式：获取 ECH 配置并构建 TLS 配置
+			echBytes, echErr := getECHList()
+			if echErr != nil {
+				log.Printf("[ECH] 获取 ECH 配置失败: %v", echErr)
+				if attempt < maxRetries {
+					log.Printf("[ECH] 尝试刷新 ECH 配置...")
+					if refreshErr := refreshECH(); refreshErr != nil {
+						log.Printf("[ECH] 刷新失败: %v", refreshErr)
+					}
+					continue
 				}
-				continue
+				return nil, fmt.Errorf("ECH 配置不可用: %v", echErr)
 			}
-			return nil, fmt.Errorf("ECH 配置不可用: %v", echErr)
+			tlsCfg, tlsErr = buildTLSConfigWithECH(serverName, echBytes)
 		}
 
-		tlsCfg, tlsErr := buildTLSConfigWithECH(serverName, echBytes)
 		if tlsErr != nil {
-			return nil, fmt.Errorf("构建 TLS(ECH) 配置失败: %v", tlsErr)
+			return nil, fmt.Errorf("构建 TLS 配置失败: %v", tlsErr)
 		}
 
 		// 配置WebSocket Dialer（增加缓冲区大小）
@@ -1000,14 +1454,15 @@ func dialWebSocketWithECH(wsServerAddr string, maxRetries int) (*websocket.Conn,
 			WriteBufferSize:  65536, // 增加写缓冲区到64KB
 		}
 
-		// 如果指定了IP地址，配置自定义拨号器（SNI 仍为 serverName）
-		if ipAddr != "" {
+		// 如果指定了IP地址（通过参数传入），配置自定义拨号器（SNI 仍为 serverName）
+		if remoteIP != "" {
 			dialer.NetDial = func(network, address string) (net.Conn, error) {
 				_, port, err := net.SplitHostPort(address)
 				if err != nil {
 					return nil, err
 				}
-				address = net.JoinHostPort(ipAddr, port)
+				// 使用指定的 IP 覆盖主机名
+				address = net.JoinHostPort(remoteIP, port)
 				return net.DialTimeout(network, address, 10*time.Second)
 			}
 		}
@@ -1015,8 +1470,8 @@ func dialWebSocketWithECH(wsServerAddr string, maxRetries int) (*websocket.Conn,
 		// 连接到WebSocket服务端（必须 wss）
 		wsConn, _, dialErr := dialer.Dial(wsServerAddr, nil)
 		if dialErr != nil {
-			// 检查是否为 ECH 相关错误
-			if strings.Contains(dialErr.Error(), "ECH") || strings.Contains(dialErr.Error(), "ech") {
+			// 如果不是 fallback 模式，且是 ECH 相关错误，尝试刷新重试
+			if !fallback && (strings.Contains(dialErr.Error(), "ECH") || strings.Contains(dialErr.Error(), "ech")) {
 				log.Printf("[ECH] 连接失败（可能 ECH 公钥已轮换）: %v", dialErr)
 				if attempt < maxRetries {
 					log.Printf("[ECH] 尝试刷新 ECH 配置并重试 (尝试 %d/%d)...", attempt, maxRetries)
@@ -1096,8 +1551,10 @@ type UDPAssociation struct {
 
 type ECHPool struct {
 	wsServerAddr  string
-	connectionNum int
+	connectionNum int // 每个 IP 建立的连接数
+	targetIPs     []string
 
+	wsConnsMu sync.RWMutex
 	wsConns   []*websocket.Conn
 	wsMutexes []sync.Mutex
 
@@ -1112,12 +1569,18 @@ type ECHPool struct {
 	pendingByChannel map[int]string
 }
 
-func NewECHPool(wsServerAddr string, n int) *ECHPool {
+func NewECHPool(wsServerAddr string, n int, targetIPs []string) *ECHPool {
+	totalConns := n
+	if len(targetIPs) > 0 {
+		totalConns = len(targetIPs) * n
+	}
+
 	return &ECHPool{
 		wsServerAddr:     wsServerAddr,
 		connectionNum:    n,
-		wsConns:          make([]*websocket.Conn, n),
-		wsMutexes:        make([]sync.Mutex, n),
+		targetIPs:        targetIPs,
+		wsConns:          make([]*websocket.Conn, totalConns),
+		wsMutexes:        make([]sync.Mutex, totalConns),
 		tcpMap:           make(map[string]net.Conn),
 		udpMap:           make(map[string]*UDPAssociation),
 		channelMap:       make(map[string]int),
@@ -1130,21 +1593,43 @@ func NewECHPool(wsServerAddr string, n int) *ECHPool {
 }
 
 func (p *ECHPool) Start() {
-	for i := 0; i < p.connectionNum; i++ {
-		go p.dialOnce(i)
+	totalConns := p.connectionNum
+	if len(p.targetIPs) > 0 {
+		totalConns = len(p.targetIPs) * p.connectionNum
+	}
+
+	for i := 0; i < totalConns; i++ {
+		// 计算当前连接应该使用的 IP
+		var specificIP string
+		if len(p.targetIPs) > 0 {
+			// 比如 2 个 IP，每个 IP 2 连接
+			// i=0 -> ip[0], i=1 -> ip[0], i=2 -> ip[1], i=3 -> ip[1]
+			ipIndex := i / p.connectionNum
+			if ipIndex < len(p.targetIPs) {
+				specificIP = p.targetIPs[ipIndex]
+			}
+		}
+
+		go p.dialOnce(i, specificIP)
 	}
 }
 
-func (p *ECHPool) dialOnce(index int) {
+func (p *ECHPool) dialOnce(index int, specificIP string) {
 	for {
-		wsConn, err := dialWebSocketWithECH(p.wsServerAddr, 2)
+		wsConn, err := dialWebSocketWithECH(p.wsServerAddr, 2, specificIP)
 		if err != nil {
-			log.Printf("[客户端] 通道 %d WebSocket(ECH) 连接失败: %v，2秒后重试", index, err)
+			ipInfo := specificIP
+			if ipInfo == "" {
+				ipInfo = "DNS"
+			}
+			log.Printf("[客户端] 通道 %d (IP:%s) WebSocket 连接失败: %v，2秒后重试", index, ipInfo, err)
 			time.Sleep(2 * time.Second)
 			continue
 		}
+		p.wsConnsMu.Lock()
 		p.wsConns[index] = wsConn
-		log.Printf("[客户端] 通道 %d WebSocket(ECH) 已连接", index)
+		p.wsConnsMu.Unlock()
+		log.Printf("[客户端] 通道 %d (IP:%s) WebSocket 已连接", index, specificIP)
 		go p.handleChannel(index, wsConn)
 		return
 	}
@@ -1163,13 +1648,21 @@ func (p *ECHPool) RegisterAndClaim(connID, target, firstFrame string, tcpConn ne
 	}
 	p.mu.Unlock()
 
+	p.wsConnsMu.RLock()
+	defer p.wsConnsMu.RUnlock()
+
 	for i, ws := range p.wsConns {
 		if ws == nil {
 			continue
 		}
 		p.mu.Lock()
-		p.claimTimes[connID][i] = time.Now()
+		// 修复：检查 map entry 是否仍然存在。
+		// 因为 handleChannel 可能在快速响应时已经清理了 connID 对应的 entry。
+		if timesMap, ok := p.claimTimes[connID]; ok {
+			timesMap[i] = time.Now()
+		}
 		p.mu.Unlock()
+
 		p.wsMutexes[i].Lock()
 		err := ws.WriteMessage(websocket.TextMessage, []byte("CLAIM:"+connID+"|"+fmt.Sprintf("%d", i)))
 		p.wsMutexes[i].Unlock()
@@ -1192,6 +1685,7 @@ func (p *ECHPool) RegisterUDP(connID string, assoc *UDPAssociation) {
 // SendUDPConnect 发送UDP连接请求（选择第一个可用通道）
 func (p *ECHPool) SendUDPConnect(connID, target string) error {
 	p.mu.RLock()
+	p.wsConnsMu.RLock()
 	var ws *websocket.Conn
 	var chID int
 	for i, w := range p.wsConns {
@@ -1201,6 +1695,7 @@ func (p *ECHPool) SendUDPConnect(connID, target string) error {
 			break
 		}
 	}
+	p.wsConnsMu.RUnlock()
 	p.mu.RUnlock()
 
 	if ws == nil {
@@ -1225,9 +1720,11 @@ func (p *ECHPool) SendUDPData(connID string, data []byte) error {
 	p.mu.RLock()
 	chID, ok := p.channelMap[connID]
 	var ws *websocket.Conn
+	p.wsConnsMu.RLock()
 	if ok && chID < len(p.wsConns) {
 		ws = p.wsConns[chID]
 	}
+	p.wsConnsMu.RUnlock()
 	p.mu.RUnlock()
 
 	if !ok || ws == nil {
@@ -1247,9 +1744,11 @@ func (p *ECHPool) SendUDPClose(connID string) error {
 	p.mu.RLock()
 	chID, ok := p.channelMap[connID]
 	var ws *websocket.Conn
+	p.wsConnsMu.RLock()
 	if ok && chID < len(p.wsConns) {
 		ws = p.wsConns[chID]
 	}
+	p.wsConnsMu.RUnlock()
 	p.mu.RUnlock()
 
 	if !ok || ws == nil {
@@ -1286,6 +1785,9 @@ func (p *ECHPool) WaitConnected(connID string, timeout time.Duration) bool {
 }
 
 func (p *ECHPool) handleChannel(channelID int, wsConn *websocket.Conn) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	wsConn.SetPingHandler(func(message string) error {
 		p.wsMutexes[channelID].Lock()
 		err := wsConn.WriteMessage(websocket.PongMessage, []byte(message))
@@ -1296,10 +1798,15 @@ func (p *ECHPool) handleChannel(channelID int, wsConn *websocket.Conn) {
 	go func() {
 		t := time.NewTicker(10 * time.Second)
 		defer t.Stop()
-		for range t.C {
-			p.wsMutexes[channelID].Lock()
-			_ = wsConn.WriteMessage(websocket.PingMessage, nil)
-			p.wsMutexes[channelID].Unlock()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				p.wsMutexes[channelID].Lock()
+				_ = wsConn.WriteMessage(websocket.PingMessage, nil)
+				p.wsMutexes[channelID].Unlock()
+			}
 		}
 	}()
 
@@ -1479,13 +1986,23 @@ func (p *ECHPool) handleChannel(channelID int, wsConn *websocket.Conn) {
 }
 
 func (p *ECHPool) redialChannel(channelID int) {
+	var specificIP string
+	if len(p.targetIPs) > 0 {
+		ipIndex := channelID / p.connectionNum
+		if ipIndex < len(p.targetIPs) {
+			specificIP = p.targetIPs[ipIndex]
+		}
+	}
+
 	for {
-		newConn, err := dialWebSocketWithECH(p.wsServerAddr, 2)
+		newConn, err := dialWebSocketWithECH(p.wsServerAddr, 2, specificIP)
 		if err != nil {
 			time.Sleep(2 * time.Second)
 			continue
 		}
+		p.wsConnsMu.Lock()
 		p.wsConns[channelID] = newConn
+		p.wsConnsMu.Unlock()
 		log.Printf("[客户端] 通道 %d 已重连", channelID)
 		go p.handleChannel(channelID, newConn)
 		return
@@ -1555,12 +2072,12 @@ func parseProxyAddr(addr string) (*ProxyConfig, error) {
 	return config, nil
 }
 
-func runProxyServer(addr, wsServerAddr string) {
+func runProxyServer(addr, wsServerAddr string, targetIPs []string) {
 	if wsServerAddr == "" {
 		log.Fatal("代理服务器需要指定 WebSocket 服务端地址 (-f)")
 	}
 
-	// 验证必须使用 wss://（强制 ECH）
+	// 验证必须使用 wss://（强制 ECH 或 TLS1.3 Fallback）
 	u, err := url.Parse(wsServerAddr)
 	if err != nil {
 		log.Fatalf("解析 WebSocket 服务端地址失败: %v", err)
@@ -1585,7 +2102,7 @@ func runProxyServer(addr, wsServerAddr string) {
 		log.Printf("代理认证已启用，用户名: %s", config.Username)
 	}
 
-	echPool = NewECHPool(wsServerAddr, connectionNum)
+	echPool = NewECHPool(wsServerAddr, connectionNum, targetIPs)
 	echPool.Start()
 
 	for {
@@ -1635,7 +2152,7 @@ func handleProxyConnection(conn net.Conn, config *ProxyConfig) {
 	log.Printf("[代理:%s] 未知协议，第一个字节: 0x%02X", clientAddr, firstByte)
 }
 
-// ======================== SOCKS5 协议处理 ========================
+// ======================== SOCKS5 协议处理 (代理客户端模式) ========================
 
 func handleSOCKS5Protocol(conn net.Conn, config *ProxyConfig, clientAddr string) {
 	// 处理认证方法协商（需要读取剩余的认证方法）
@@ -1885,7 +2402,7 @@ func handleSOCKS5Connect(conn net.Conn, target, clientAddr string) error {
 	}
 }
 
-// ======================== SOCKS5 UDP ASSOCIATE（使用连接池） ========================
+// ======================== SOCKS5 UDP ASSOCIATE (代理客户端模式，使用连接池) ========================
 
 // handleSOCKS5UDPAssociate 处理UDP ASSOCIATE请求（使用ECH连接池）
 func handleSOCKS5UDPAssociate(tcpConn net.Conn, clientAddr string, config *ProxyConfig) error {
@@ -1929,7 +2446,7 @@ func handleSOCKS5UDPAssociate(tcpConn net.Conn, clientAddr string, config *Proxy
 		tcpConn:     tcpConn,
 		udpListener: udpListener,
 		pool:        echPool,
-		done:        make(chan bool, 2),
+		done:        make(chan bool, 5),
 		connected:   make(chan bool, 1),
 	}
 
@@ -2065,14 +2582,12 @@ func (assoc *UDPAssociation) sendUDPData(target string, data []byte) error {
 		}
 
 		// 等待连接成功
-		go func() {
-			if !assoc.pool.WaitConnected(assoc.connID, 5*time.Second) {
-				log.Printf("[UDP:%s] 连接超时", assoc.connID)
-				assoc.done <- true
-				return
-			}
-			log.Printf("[UDP:%s] 连接已建立", assoc.connID)
-		}()
+		if !assoc.pool.WaitConnected(assoc.connID, 5*time.Second) {
+			log.Printf("[UDP:%s] 连接超时", assoc.connID)
+			assoc.done <- true
+			return fmt.Errorf("UDP连接超时")
+		}
+		log.Printf("[UDP:%s] 连接已建立", assoc.connID)
 	}
 
 	// 发送实际数据
@@ -2258,7 +2773,7 @@ func buildSOCKS5UDPPacket(host string, port int, data []byte) ([]byte, error) {
 	return packet, nil
 }
 
-// ======================== HTTP 代理协议处理 ========================
+// ======================== HTTP 代理协议处理 (代理客户端模式) ========================
 
 func handleHTTPProtocol(conn net.Conn, config *ProxyConfig, clientAddr string, firstByte byte) {
 	// 读取完整的第一行（HTTP 请求行）
