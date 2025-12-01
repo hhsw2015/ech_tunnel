@@ -96,7 +96,7 @@ BuildReleaseAndroid() {
 BuildLoongGLIBC() {
   local target_abi="$2"
   local output_file="$1"
-  local oldWorldGoVersion="1.25.0"
+  local oldWorldGoVersion="1.25.4"
  
   if [ "$target_abi" = "abi1.0" ]; then
     echo building for linux-loong64-abi1.0
