@@ -123,7 +123,9 @@ BuildLoongGLIBC() {
  
     local cache_dir="$(pwd)/go-loong64-abi1.0-cache"
     mkdir -p "$cache_dir"
- 
+
+    export CGO_CFLAGS="-fPIC"
+    export CGO_LDFLAGS="-fPIC"
     env GOOS=linux GOARCH=loong64 \
         CC="$(pwd)/gcc8-loong64-abi1.0/bin/loongarch64-linux-gnu-gcc" \
         CXX="$(pwd)/gcc8-loong64-abi1.0/bin/loongarch64-linux-gnu-g++" \
@@ -137,7 +139,9 @@ BuildLoongGLIBC() {
     rm -rf gcc12-loong64-abi2.0 && mkdir gcc12-loong64-abi2.0
     tar -Jxf gcc12-loong64-abi2.0.tar.xz -C gcc12-loong64-abi2.0 --strip-components=1
     rm gcc12-loong64-abi2.0.tar.xz
- 
+
+    export CGO_CFLAGS="-fPIC"
+    export CGO_LDFLAGS="-fPIC"
     CC=$(pwd)/gcc12-loong64-abi2.0/bin/loongarch64-unknown-linux-gnu-gcc \
     CXX=$(pwd)/gcc12-loong64-abi2.0/bin/loongarch64-unknown-linux-gnu-g++ \
     GOOS=linux GOARCH=loong64 CGO_ENABLED=1 \
