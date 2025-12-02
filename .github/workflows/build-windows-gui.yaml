@@ -1,0 +1,45 @@
+name: Release Windows GUI
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release tag（例如 v1.5.0 或 nightly-20251201）'
+        required: true
+        type: string
+
+  release:
+    types: [published]
+
+# Release 需要写权限
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    steps:
+      # 1. 检出代码
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install MinGW (gcc)
+        run: choco install mingw -y
+
+      # 3. 编译资源文件 + 主程序
+      - name: Build Windows GUI executable
+        run: |
+          cd ech-tunnel-windows-gui-src
+          windres resource.rc -o resource.o
+          gcc -Wall -Wextra -std=c99 -finput-charset=UTF-8 -fexec-charset=GBK -Os -s -o ech-tunnel-windows-gui.exe resource.o main.c -luser32 -lkernel32 -lcomctl32 -lgdi32 -mwindows
+
+      - name: Upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ech-tunnel-windows-gui-src/ech-tunnel-windows-gui.exe
+          tag_name: ${{ inputs.version }}
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
