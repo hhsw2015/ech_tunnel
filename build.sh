@@ -310,10 +310,8 @@ build_single() {
         local file_size=$(du -h "${output_dir}/${output_name}" | cut -f1)
         echo -e "✓ ${platform} 编译成功 (${file_size})"
         echo -e "  输出文件: ${output_dir}/${output_name}"
-        return 0
     else
         echo -e "✗ ${platform} 编译失败"
-        return 1
     fi
 }
 
