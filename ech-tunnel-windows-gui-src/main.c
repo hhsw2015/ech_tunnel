@@ -1297,6 +1297,18 @@ DWORD WINAPI LogReaderThread(LPVOID lpParam) {
 
 void AppendLog(const char* text) {
     if (!IsWindow(hLogEdit)) return;
+    
+    int currentLen = GetWindowTextLength(hLogEdit);
+    
+    // 限制日志最大长度为80KB
+    if (currentLen > 80000) {
+        SendMessage(hLogEdit, WM_SETREDRAW, FALSE, 0);
+        SendMessage(hLogEdit, EM_SETSEL, 0, 32000);  // 删除前32KB
+        SendMessage(hLogEdit, EM_REPLACESEL, FALSE, (LPARAM)"");
+        SendMessage(hLogEdit, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(hLogEdit, NULL, TRUE);
+    }
+    
     int len = GetWindowTextLength(hLogEdit);
     SendMessage(hLogEdit, EM_SETSEL, len, len);
     SendMessage(hLogEdit, EM_REPLACESEL, FALSE, (LPARAM)text);
