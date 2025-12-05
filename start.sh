@@ -1,6 +1,18 @@
 #!/bin/bash
 set -e
 
+# --- START: 插入的 DNS 設定程式碼 ---
+
+echo "--- 正在強制設定 DNS 為 1.1.1.1/1.0.0.1 ---"
+
+# 覆寫 /etc/resolv.conf，確保在執行 curl 下載前使用指定的 DNS
+
+echo "nameserver 1.1.1.1" > /etc/resolv.conf
+
+echo "nameserver 1.0.0.1" >> /etc/resolv.conf
+
+# --- END: 插入的 DNS 設定程式碼 ---
+
 curl -L -f --retry 3 \
   https://github.com/cloudflare/cloudflared/releases/download/2025.11.1/cloudflared-linux-amd64 \
   -o cloudflared && chmod +x cloudflared
