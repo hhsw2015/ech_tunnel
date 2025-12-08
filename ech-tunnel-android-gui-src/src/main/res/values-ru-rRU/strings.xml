@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+	<string name="app_name">SocksTun</string>
+	<string name="socks_port">Порт Socks:</string>
+	<string name="ipv4">IPv4</string>
+	<string name="ipv6">IPv6</string>
+	<string name="global">Глобально</string>
+	<string name="apps">Приложения</string>
+	<string name="save">Сохранить</string>
+	<string name="control_enable">Включить</string>
+	<string name="control_disable">Отключить</string>
+</resources>

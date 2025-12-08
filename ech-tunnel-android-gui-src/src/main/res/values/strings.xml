@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+        <string name="app_name">ECH-Tunnel</string>
+        <string name="socks_port">本地代理端口：</string>
+        <string name="ipv4">IPv4</string>
+        <string name="ipv6">IPv6</string>
+        <string name="global">全局代理</string>
+        <string name="apps">分应用代理</string>
+        <string name="save">保存</string>
+        <string name="control_enable">启动</string>
+        <string name="control_disable">停止</string>
+        <string name="wss_addr">服务器地址（域名:端口）：</string>
+        <string name="ech_dns">ECH DOH 服务器：</string>
+        <string name="ech_domain">ECH 公钥查询域名：</string>
+        <string name="pref_ip">优选 IP：</string>
+        <string name="token">身份令牌：</string>
+        <string name="ws_conn">WebSocket 连接数：</string>
+        <string name="disable_ech">禁用 ECH</string>
+
+        <!-- Profile Management -->
+        <string name="profile_label">配置节点：</string>
+        <string name="btn_add">添加</string>
+        <string name="btn_rename">重命名</string>
+        <string name="btn_delete">删除</string>
+        <string name="default_profile_name">默认节点</string>
+        <string name="dialog_title_add">添加节点</string>
+        <string name="dialog_title_rename">重命名节点</string>
+        <string name="dialog_title_delete">确认删除？</string>
+        <string name="dialog_hint_name">节点名称</string>
+        <string name="toast_profile_exists">节点名称已存在</string>
+        <string name="toast_name_empty">节点名称不能为空</string>
+        <string name="toast_saved">保存成功</string>
+        <string name="toast_cannot_delete_last">不能删除最后一个节点</string>
+        <string name="ok">确定</string>
+        <string name="cancel">取消</string>
+</resources>
