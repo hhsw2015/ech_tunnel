@@ -1,0 +1,111 @@
+apply plugin: 'com.android.application'
+
+android {
+        namespace "com.ech.tunnel"
+        compileSdkVersion 34
+        ndkVersion "26.3.11579264"
+
+        defaultConfig {
+                applicationId "com.ech.tunnel"
+                minSdkVersion 24
+                targetSdkVersion 34
+                versionCode 1
+                versionName "1.0"
+                // archivesName 不在 defaultConfig 作用域，移至 base 扩展
+                ndk {
+                        abiFilters "armeabi-v7a", "arm64-v8a",'x86','x86_64'
+                }
+                externalNativeBuild {
+                        ndkBuild {
+                                arguments "APP_CFLAGS+=-DPKGNAME=com/ech/tunnel -ffile-prefix-map=${rootDir}=."
+                                arguments "APP_LDFLAGS+=-Wl,--build-id=none"
+                        }
+                }
+        }
+
+signingConfigs {
+    release {
+        if (rootProject.file('store.properties').exists()) {
+            def props = new Properties()
+            props.load(new FileInputStream(rootProject.file('store.properties')))
+            storeFile rootProject.file(props['storeFile'])
+            storePassword props['storePassword']
+            keyAlias props['keyAlias']
+            keyPassword props['keyPassword']
+        }
+    }
+}
+
+        buildTypes {
+                release {
+                        minifyEnabled false
+                        signingConfig signingConfigs.release
+                }
+                debug {
+                        minifyEnabled false
+                        signingConfig signingConfigs.release
+                }
+        }
+
+        splits {
+                abi {
+                        enable true
+                        reset()
+                        include 'armeabi-v7a', 'arm64-v8a', 'x86', 'x86_64'
+                        universalApk true
+                }
+        }
+
+	def propsFile = rootProject.file('store.properties')
+	def configName = 'release'
+
+	if (propsFile.exists() && android.signingConfigs.hasProperty(configName)) {
+		def props = new Properties()
+		props.load(new FileInputStream(propsFile))
+		if (props!=null && props.containsKey('storeFile')) {
+			android.signingConfigs[configName].storeFile = rootProject.file(props['storeFile'])
+			android.signingConfigs[configName].storePassword = props['storePassword']
+			android.signingConfigs[configName].keyAlias = props['keyAlias']
+			android.signingConfigs[configName].keyPassword = props['keyPassword']
+		}
+	}
+
+	externalNativeBuild {
+		ndkBuild {
+			path "src/main/jni/Android.mk"
+		}
+	}
+
+	lintOptions {
+		checkReleaseBuilds false
+		// Or, if you prefer, you can continue to check for errors in release builds,
+		// but continue the build even when errors are found:
+		abortOnError false
+	}
+
+	dependenciesInfo {
+		// Disables dependency metadata when building APKs.
+		includeInApk = false
+		// Disables dependency metadata when building Android App Bundles.
+		includeInBundle = false
+	}
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+plugins.withId('base') {
+    base {
+        archivesName = "${android.defaultConfig.applicationId}-${android.defaultConfig.versionName}"
+    }
+}
+
+repositories {
+        flatDir { dirs rootProject.projectDir }
+}
+
+dependencies {
+        implementation 'androidx.appcompat:appcompat:1.4.1'
+        implementation(name: 'ech-tunnel', ext: 'aar')
+}
