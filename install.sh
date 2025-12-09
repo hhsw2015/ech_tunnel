@@ -1,5 +1,7 @@
 #!/bin/bash
 
+# cd ~ && curl -L https://raw.githubusercontent.com/hhsw2015/ech_tunnel/refs/heads/main/install.sh -o install.sh && chmod +x install.sh && ./install.sh
+
 set -e
 # === 颜色定义 ===
 RED='\033[0;31m'
