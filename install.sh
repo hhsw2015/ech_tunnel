@@ -104,7 +104,7 @@ fi
 
 
 echo -e "${BLUE}请在客户端运行ech_tunnel...${NC}"
-echo "./ech_tunnel -l proxy://127.0.0.1:30000 -f wss://${TUNNEL_URL}:443 -ip 104.16.16.16,104.19.237.82 -token ${ECH_TUNNEL_TOKEN} -n 4"
+echo "./ech_tunnel -l proxy://127.0.0.1:30007 -f wss://${TUNNEL_URL}:443 -ip 104.16.16.16,104.19.237.82 -token ${ECH_TUNNEL_TOKEN} -n 4"
 
 cd $HOME
 
