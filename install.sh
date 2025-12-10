@@ -73,7 +73,7 @@ echo "[INFO] Starting Cloudflare tunnel..."
 attempt=1
 while [ $attempt -le $max_retries ]; do
   echo "[INFO] Attempt $attempt/$max_retries to start Cloudflare tunnel..."
-  nohup $CLOUDFLARED_BIN tunnel --no-tls-verify --url http://${LOCAL_ADDR} 2>&1 | tee -a $CLOUDFLARED_LOG &
+  nohup $CLOUDFLARED_BIN tunnel --protocol http2 --no-tls-verify --url http://${LOCAL_ADDR} 2>&1 | tee -a $CLOUDFLARED_LOG &
   sleep 5
   if grep -q 'https://.*\.trycloudflare\.com' "$CLOUDFLARED_LOG"; then
     echo "[SUCCESS] Cloudflare tunnel started successfully"
