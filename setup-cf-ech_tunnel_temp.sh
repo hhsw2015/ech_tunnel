@@ -8,7 +8,6 @@ YELLOW='\033[1;33m'
 BLUE='\033[1;34m'
 NC='\033[0m' # 清除颜色
 
-
 CLOUDFLARE_URL=""
 CLOUDFLARE_TOKEN=""
 
