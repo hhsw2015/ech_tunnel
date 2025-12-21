@@ -17,7 +17,7 @@ ECH_TUNNEL_URL="https://github.com/hhsw2015/ech_tunnel/releases/download/v1.0/ec
 ECH_TUNNEL_BIN_NAME="ech-tunnel-linux-amd64"
 CLOUDFLARED_PROTOCOL=""
 
-HOME_DIR="/home/appuser"
+HOME_DIR="/home/container"
 ARCH=$(uname -m)
 
 if [[ "$ARCH" == "aarch64" ]]; then
